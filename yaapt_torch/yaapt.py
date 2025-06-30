@@ -38,6 +38,8 @@ torch.set_num_threads(1)
 import torchaudio
 from math import floor, ceil, isnan
 from typing import Dict, List, Tuple, Any
+from scipy.signal import firwin
+import numpy as np
 
 class SignalObj(object):
 
@@ -50,15 +52,40 @@ class SignalObj(object):
         self.filtered = data # Nope
 
     def filtered_version(self, parameters:Dict[str, float]):
+    """
+    Filters the signal using an FIR bandpass filter that replicates the
+    original pYAAPT NumPy implementation.
+    """
+    # --- Start: Replicated FIR bandpass filter ---
+    f_hp = parameters['bp_low']
+    f_lp = parameters['bp_high']
+    fs = self.fs
+    filter_order = int(parameters['bp_forder'])
 
-        # Filter the signal.
+    # Get FIR filter coefficients from scipy.signal.firwin
+    f1 = f_hp / (fs / 2)
+    f2 = f_lp / (fs / 2)
+    fir_coeffs = torch.from_numpy(
+        firwin(filter_order + 1, [f1, f2], pass_zero=False).astype(np.float32)
+    ).to(self.data.device)
 
-        _a = torchaudio.functional.lowpass_biquad(self.data, int(self.fs), parameters['bp_low'])
-        _a = torchaudio.functional.highpass_biquad(_a, int(self.fs), parameters['bp_high'])
+    # Prepare for conv1d: (out_channels, in_channels, kernel_size)
+    fir_coeffs = fir_coeffs.view(1, 1, -1)
 
-        # Decimate the filtered output.
-        self.filtered = _a
-        self.new_fs = self.fs
+    # Pad the signal for 'same' convolution. lfilter is a causal filter,
+    # so we pad at the beginning to align the output.
+    padding = (filter_order, 0)
+    padded_signal = torch.nn.functional.pad(self.data.view(1, 1, -1), padding)
+
+    # Apply FIR filter using conv1d
+    # The output will have a delay, which we trim from the end to match lfilter's output length
+    filtered_signal = torch.nn.functional.conv1d(padded_signal, fir_coeffs).squeeze()
+    filtered_signal = filtered_signal[:self.data.shape[0]]
+    # --- End: Replicated FIR bandpass filter ---
+
+    self.filtered = filtered_signal
+    self.new_fs = self.fs
+
 
 
 def medfilt(tensor, kernel_size:int):
@@ -314,6 +341,17 @@ def spec_track(signal:SignalObj, pitch:PitchObj, parameters:Dict[str, float]) ->
         size=(spec_pitch.numel(),),                # Interpolate to desired size
         mode='linear'
     ).squeeze()
+
+    # This block adds the 3-point moving average filter (lfilter) that
+    # was present in the original NumPy version.
+    # Note: A perfect lfilter replication is complex. This conv1d with
+    # replicate padding is a very close and effective approximation.
+    smoother = torch.ones(3, device=spec_pitch.device, dtype=spec_pitch.dtype) / 3
+    smoother = smoother.view(1, 1, -1)
+
+    # Pad with 'replicate' to handle boundaries better than zero-padding
+    padded_spec_pitch = torch.nn.functional.pad(spec_pitch.view(1, 1, -1), (1, 1), mode='replicate')
+    spec_pitch = torch.nn.functional.conv1d(padded_spec_pitch, smoother).squeeze()
 
 
     spec_pitch[0] = spec_pitch[2]
@@ -836,6 +874,7 @@ def _yaapt(_in:torch.Tensor, kwargs:Dict[str, float]):
     parameters['f0_min'] = kwargs.get('f0_min', 60.0)               #Minimum F0 searched (Hz)
     parameters['f0_max'] = kwargs.get('f0_max', 400.0)              #Maximum F0 searched (Hz)
     parameters['fft_length'] = kwargs.get('fft_length', 8192.0)       #FFT length
+    parameters['bp_forder'] = kwargs.get('bp_forder', 150.0)  
     parameters['bp_low'] = kwargs.get('bp_low', 50.0)               #Low frequency of filter passband (Hz)
     parameters['bp_high'] = kwargs.get('bp_high', 1500.0)           #High frequency of filter passband (Hz)
     parameters['nlfer_thresh1'] = kwargs.get('nlfer_thresh1', 0.75) #NLFER boundary for voiced/unvoiced decisions
